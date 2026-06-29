@@ -47,6 +47,9 @@ ALLOWED_TCP_PORTS="80 443"
 # Email for unattended-upgrade reports. Leave blank to skip mail.
 ADMIN_EMAIL=""
 
+# Configure unattended-upgrades to automatically reboot if required (at 02:00)
+AUTO_REBOOT=false
+
 # Run a full package upgrade now as part of the patching module. Off by default
 # because it can restart services on a production host.
 APPLY_UPGRADES_NOW=false
@@ -116,6 +119,11 @@ FLAGS:
   --dry-run            Force preview mode.
   -y, --non-interactive   Skip all prompts and use the CONFIG defaults.
   --interactive        Force the interactive prompts even without a terminal.
+  --production         Bypass prompts, use Production Recommended profile.
+  --all                Bypass prompts, use ALL Hardening Modules.
+  --custom             Bypass prompts, use default module selections.
+  --ports "80 443"     Specify allowed TCP ports (bypasses prompt).
+  --auto-reboot        Enable automatic reboot for unattended-upgrades.
   -h, --help           Show this help.
 
 SAFETY:
@@ -126,16 +134,31 @@ HELP
 }
 
 # Parse arguments
-for arg in "${@:-}"; do
-  case "$arg" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --apply)              DRY_RUN=false; MODE_SET=true ;;
     --dry-run)            DRY_RUN=true;  MODE_SET=true ;;
     -y|--non-interactive) FORCE_NONINTERACTIVE=true ;;
     --interactive)        FORCE_INTERACTIVE=true ;;
+    --production)         FORCE_NONINTERACTIVE=true; CLI_PROFILE="production" ;;
+    --all)                FORCE_NONINTERACTIVE=true; CLI_PROFILE="all" ;;
+    --custom)             FORCE_NONINTERACTIVE=true; CLI_PROFILE="custom" ;;
+    --auto-reboot)        AUTO_REBOOT=true ;;
+    --ports)
+      if [ -n "${2:-}" ]; then
+        ALLOWED_TCP_PORTS="$2"
+        SKIP_PORTS_PROMPT=true
+        shift
+      else
+        echo "--ports requires a quoted string of ports (e.g., \"80 443\")"
+        exit 1
+      fi
+      ;;
     -h|--help)            show_help; exit 0 ;;
     "")                   ;;
-    *) echo "Unknown argument: $arg"; echo "Use --help."; exit 1 ;;
+    *) echo "Unknown argument: $1"; echo "Use --help."; exit 1 ;;
   esac
+  shift
 done
 
 # ---- Logging and UI helpers ----
@@ -231,7 +254,7 @@ set_logindef() {
   if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]" "$file"; then
     run sed -ri "s|^[[:space:]]*#?[[:space:]]*(${key})[[:space:]].*|\1\t${value}|" "$file"
   else
-    append_line "${key}	${value}" "$file"
+    append_line "${key} ${value}" "$file"
   fi
 }
 
@@ -241,6 +264,21 @@ apt_install() {
 
 pkg_installed() {
   dpkg -s "$1" >/dev/null 2>&1
+}
+
+detect_cloud_provider() {
+  local provider="none"
+  if [ -r /sys/class/dmi/id/sys_vendor ]; then
+    local vendor; vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+    case "$vendor" in
+      *amazon*) provider="AWS" ;;
+      *microsoft*) provider="Azure" ;;
+      *google*) provider="GCP" ;;
+      *hetzner*) provider="Hetzner" ;;
+      *digitalocean*) provider="DigitalOcean" ;;
+    esac
+  fi
+  echo "$provider"
 }
 
 detect_ssh_port() {
@@ -273,7 +311,7 @@ declare -A MOD_LABEL=(
   [login_policy]="Password and login policy"
   [disable_filesystems]="Disable unused filesystems and protocols"
   [coredumps]="Disable core dumps"
-  [shared_memory]="Harden /dev/shm  (edits fstab, off by default)"
+  [shared_memory]="Shared Memory Hardening (edits fstab, off by default)"
   [aide]="File integrity monitoring (AIDE)"
   [remove_packages]="Remove legacy insecure packages"
   [session_timeout]="Idle shell timeout"
@@ -584,8 +622,12 @@ APT::Periodic::AutocleanInterval "7";'
 
   local mailline="// Unattended-Upgrade::Mail \"\";"
   [ -n "$ADMIN_EMAIL" ] && mailline="Unattended-Upgrade::Mail \"${ADMIN_EMAIL}\";"
+  local auto_reboot="false"
+  [ "$AUTO_REBOOT" = true ] && auto_reboot="true"
+  
   write_file /etc/apt/apt.conf.d/51hardening-unattended \
-"Unattended-Upgrade::Automatic-Reboot \"false\";
+"Unattended-Upgrade::Automatic-Reboot \"${auto_reboot}\";
+Unattended-Upgrade::Automatic-Reboot-Time \"02:00\";
 Unattended-Upgrade::Remove-Unused-Dependencies \"true\";
 ${mailline}"
 
@@ -694,13 +736,17 @@ MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@op
 
 mod_firewall() {
   head_ "3. Host firewall (ufw)"
+  local cloud; cloud="$(detect_cloud_provider)"
+  if [ "$cloud" != "none" ]; then
+    warn "Cloud provider detected (${cloud}). Ensure your cloud security groups allow SSH before applying UFW."
+  fi
   apt_install ufw
   [ -z "$SSH_PORT" ] && SSH_PORT="$(detect_ssh_port)"
 
   # Open every plausible SSH port (current, target, and any in-progress migration)
   # so neither a port change nor module ordering can lock us out.
   local ssh_ports sp
-  ssh_ports="$(printf '%s\n' "$(detect_ssh_port)" "$SSH_PORT" "${SSH_MIGRATE_OLD_PORT:-}" | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')"
+  ssh_ports="$(printf '%s\n' "$(detect_ssh_port)" "$SSH_PORT" "${SSH_MIGRATE_OLD_PORT:-}" | grep -E '^[0-9]+$' | sort -un | xargs)"
   info "Allowing SSH on port(s) ${ssh_ports} before enabling the firewall."
 
   run ufw default deny incoming
@@ -730,7 +776,6 @@ mod_firewall() {
     ufw status verbose | tee -a "$LOGFILE"
   fi
   ok "Firewall configured."
-  info "Allowed ports:"
   printf "  SSH: %s\n" "$ssh_ports"
   printf "  TCP: %s\n" "${ALLOWED_TCP_PORTS:-none}"
   mark applied firewall
@@ -768,6 +813,15 @@ port    = ${SSH_PORT}"
 
 mod_sysctl() {
   head_ "5. Kernel and network hardening (sysctl)"
+  if command -v aa-status >/dev/null 2>&1; then
+    if aa-status 2>/dev/null | grep -q "apparmor module is loaded."; then
+      info "AppArmor is loaded and active."
+    else
+      warn "AppArmor is installed but not active."
+    fi
+  else
+    warn "AppArmor is not installed (aa-status missing)."
+  fi
   write_file /etc/sysctl.d/99-hardening.conf \
 '# Network
 net.ipv4.conf.all.rp_filter = 1
@@ -1033,6 +1087,79 @@ print_security_status() {
   printf '================================================\n\n'
 }
 
+generate_reports() {
+  local json_file="/var/log/server-hardening-report.json"
+  local md_file="/var/log/server-hardening-report.md"
+
+  # Generate JSON
+  cat > "$json_file" <<EOF
+{
+  "timestamp": "${TIMESTAMP}",
+  "os": "${PRETTY_NAME:-Unknown}",
+  "profile": "${SELECTED_PROFILE:-Unknown}",
+  "dry_run": ${DRY_RUN},
+  "modules_applied": [$(printf '"%s",' "${APPLIED[@]:-}" | sed 's/,$//')],
+  "modules_skipped": [$(printf '"%s",' "${SKIPPED[@]:-}" | sed 's/,$//')],
+  "modules_failed": [$(printf '"%s",' "${FAILED[@]:-}" | sed 's/,$//')]
+}
+EOF
+
+  # Generate Markdown
+  cat > "$md_file" <<EOF
+# Server Hardening Report
+
+- **Date:** $(date)
+- **OS:** ${PRETTY_NAME:-Unknown}
+- **Profile:** ${SELECTED_PROFILE:-Unknown}
+- **Mode:** $([ "$DRY_RUN" = true ] && echo "Preview (Dry Run)" || echo "Applied")
+
+## Security Status
+
+- SSH Hardening: $([ "${MOD_ENABLED[ssh]}" = true ] && echo "✓" || echo "✗")
+- Firewall: $([ "${MOD_ENABLED[firewall]}" = true ] && echo "✓" || echo "✗")
+- Fail2Ban: $([ "${MOD_ENABLED[fail2ban]}" = true ] && echo "✓" || echo "✗")
+- Auditd: $([ "${MOD_ENABLED[auditd]}" = true ] && echo "✓" || echo "✗")
+- AIDE: $([ "${MOD_ENABLED[aide]}" = true ] && echo "✓" || echo "✗")
+- Chrony: $([ "${MOD_ENABLED[timesync]}" = true ] && echo "✓" || echo "✗")
+
+## Modules Applied
+EOF
+  if [ "${#APPLIED[@]}" -eq 0 ]; then
+    echo "None" >> "$md_file"
+  else
+    local mod
+    for mod in "${APPLIED[@]}"; do
+      echo "- ${MOD_LABEL[$mod]%% (*}" >> "$md_file"
+    done
+  fi
+
+  cat >> "$md_file" <<EOF
+
+## Modules Skipped
+EOF
+  if [ "${#SKIPPED[@]}" -eq 0 ]; then
+    echo "None" >> "$md_file"
+  else
+    local mod
+    for mod in "${SKIPPED[@]}"; do
+      echo "- ${MOD_LABEL[$mod]%% (*}" >> "$md_file"
+    done
+  fi
+
+  if [ "${#FAILED[@]}" -gt 0 ]; then
+    cat >> "$md_file" <<EOF
+
+## Modules Failed
+EOF
+    local mod
+    for mod in "${FAILED[@]}"; do
+      echo "- ${MOD_LABEL[$mod]%% (*}" >> "$md_file"
+    done
+  fi
+
+  info "Reports generated: ${json_file} and ${md_file}"
+}
+
 # =====================================================================
 # Main
 # =====================================================================
@@ -1073,19 +1200,22 @@ main() {
   fi
   info "Log file: ${LOGFILE}"
 
+
   local mod
   for mod in "${MOD_ORDER[@]}"; do
     if [ "${MOD_ENABLED[$mod]}" = true ]; then
       "mod_${mod}"
     else
-      skip "${MOD_LABEL[$mod]%% (*} (skipped)"
+      skip "${MOD_LABEL[$mod]%% (*} (disabled in profile)"
       mark skipped "$mod"
     fi
   done
 
   head_ "Summary"
 
-  printf '  %bApplied Modules%b\n\n' "$C_BOLD" "$C_RESET"
+  local applied_title="Applied Modules"
+  [ "$DRY_RUN" = true ] && applied_title="Modules Selected"
+  printf '  %b%s%b\n\n' "$C_BOLD" "$applied_title" "$C_RESET"
   if [ "${#APPLIED[@]}" -eq 0 ]; then
     printf '   none\n'
   else
@@ -1105,10 +1235,15 @@ main() {
   fi
   printf '\n'
 
+  printf '=========================================\n'
+  printf 'Hardening Completed Successfully\n'
+  printf '=========================================\n\n'
+  printf 'Applied : %d\n' "${#APPLIED[@]}"
+  printf 'Skipped : %d\n' "${#SKIPPED[@]}"
+  printf 'Failed  : %d\n\n' "${#FAILED[@]}"
+  
   if [ "${#FAILED[@]}" -gt 0 ]; then
-    err "Failed: ${FAILED[*]}"
-  else
-    ok "Failed: none"
+    err "Failed modules: ${FAILED[*]}"
   fi
 
   _log ""
@@ -1118,15 +1253,13 @@ main() {
     warn "Done. Before closing this session, open a NEW SSH session and confirm you can still log in."
     print_security_status
 
-    printf 'A reboot is recommended.\n\n'
-    printf 'Reason:\n\n'
-    printf '✓ sysctl updated\n'
-    printf '✓ kernel parameters changed\n'
-    printf '✓ audit rules updated\n\n'
-    printf 'Run:\n\n'
-    printf 'sudo reboot\n\n'
-    printf 'when your maintenance window begins.\n'
+    if [ -f /var/run/reboot-required ]; then
+      warn "Reboot required"
+    else
+      ok "No reboot required"
+    fi
     printf '================================================\n'
+    generate_reports
   fi
 }
 
