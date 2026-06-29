@@ -42,7 +42,7 @@ SSH_PORT=""
 
 # Inbound TCP ports to allow through the firewall, space separated. SSH is allowed
 # automatically. Interactive runs ask for this.
-ALLOWED_TCP_PORTS="80 443 8000 3306 143 25"
+ALLOWED_TCP_PORTS="80 443"
 
 # Email for unattended-upgrade reports. Leave blank to skip mail.
 ADMIN_EMAIL=""
@@ -82,6 +82,7 @@ SSH_MIGRATE_OLD_PORT=""        # set by mod_ssh when the SSH port is being chang
 MODE_SET=false                 # true if --apply/--dry-run was passed
 FORCE_NONINTERACTIVE=false
 FORCE_INTERACTIVE=false
+SELECTED_PROFILE="CONFIG Default"
 
 # Colors. Terminal green accent is #00FF9C. Disabled when not a terminal,
 # when NO_COLOR is set, or for dumb terminals.
@@ -320,6 +321,10 @@ warn_risky_ports() {
   for p in $ALLOWED_TCP_PORTS; do
     case "$p" in
       3306) warn "Port 3306 (database) will be open to all sources. If the DB lives on this host with the app, you usually do not need it public. Consider restricting it to a specific IP." ;;
+      5432) warn "Port 5432 (Postgres) will be open to all sources. Consider restricting it to a specific IP." ;;
+      6379) warn "Port 6379 (Redis) should almost never be public. Restrict it to 127.0.0.1 or a specific IP." ;;
+      9200) warn "Port 9200 (Elasticsearch) without auth can leak data. Ensure it is secured or restricted." ;;
+      27017) warn "Port 27017 (MongoDB) without auth is highly risky. Consider restricting it to a specific IP." ;;
       8000) warn "Port 8000 (Frappe backend) open publicly bypasses nginx and TLS. In production, keep it internal on 127.0.0.1." ;;
       25)   warn "Port 25 (SMTP) is plaintext. Keep only if this host receives inbound mail, and make sure it is not an open relay." ;;
       143)  warn "Port 143 (IMAP) is plaintext. Prefer 993 (IMAPS)." ;;
@@ -370,14 +375,90 @@ choose_modules() {
 }
 
 prompt_scope() {
+  local input="" k
+
   section "What to run"
-  printf '  %b1%b  Run ALL hardening modules\n' "$C_GREEN" "$C_RESET"
-  printf '  %b2%b  Select specific modules\n' "$C_GREEN" "$C_RESET"
+
+  printf '  %b1%b  Run Production Recommended\n' "$C_GREEN" "$C_RESET"
+  printf '      Safe defaults for production servers\n'
+  printf '      Recommended for Frappe, ERPNext, Nginx, Node.js and application servers\n\n'
+
+  printf '  %b2%b  Run ALL Hardening Modules\n' "$C_GREEN" "$C_RESET"
+  printf '      Includes every available module\n'
+  printf '      Enables optional modules such as Shared Memory Hardening and ClamAV\n\n'
+
+  printf '  %b3%b  Select Specific Modules\n' "$C_GREEN" "$C_RESET"
+  printf '      Choose modules individually\n\n'
+
   printf '%bChoose [1]:%b ' "$C_CYAN" "$C_RESET"
-  local input="" k; read -r input
+  read -r input
+
   case "$input" in
-    2) choose_modules ;;
-    *) for k in "${MOD_ORDER[@]}"; do MOD_ENABLED[$k]=true; done ;;
+
+    ""|1)
+        SELECTED_PROFILE="Production Recommended"
+        # Reset all modules
+        for k in "${MOD_ORDER[@]}"; do
+            MOD_ENABLED[$k]=false
+        done
+
+        # Production Recommended
+        MOD_ENABLED[updates]=true
+        MOD_ENABLED[ssh]=true
+        MOD_ENABLED[firewall]=true
+        MOD_ENABLED[fail2ban]=true
+        MOD_ENABLED[sysctl]=true
+        MOD_ENABLED[auditd]=true
+        MOD_ENABLED[timesync]=true
+        MOD_ENABLED[login_policy]=true
+        MOD_ENABLED[disable_filesystems]=true
+        MOD_ENABLED[coredumps]=true
+        MOD_ENABLED[aide]=true
+        MOD_ENABLED[remove_packages]=true
+        MOD_ENABLED[session_timeout]=true
+        MOD_ENABLED[process_accounting]=true
+
+        # Leave optional modules disabled
+        MOD_ENABLED[shared_memory]=false
+        MOD_ENABLED[clamav]=false
+        ;;
+
+    2)
+        SELECTED_PROFILE="ALL Hardening Modules"
+        # Enable every module
+        for k in "${MOD_ORDER[@]}"; do
+            MOD_ENABLED[$k]=true
+        done
+        ;;
+
+    3)
+        SELECTED_PROFILE="Custom Modules"
+        choose_modules
+        ;;
+
+    *)
+        SELECTED_PROFILE="Production Recommended"
+        warn "Invalid selection. Using Production Recommended."
+
+        for k in "${MOD_ORDER[@]}"; do
+            MOD_ENABLED[$k]=false
+        done
+
+        MOD_ENABLED[updates]=true
+        MOD_ENABLED[ssh]=true
+        MOD_ENABLED[firewall]=true
+        MOD_ENABLED[fail2ban]=true
+        MOD_ENABLED[sysctl]=true
+        MOD_ENABLED[auditd]=true
+        MOD_ENABLED[timesync]=true
+        MOD_ENABLED[login_policy]=true
+        MOD_ENABLED[disable_filesystems]=true
+        MOD_ENABLED[coredumps]=true
+        MOD_ENABLED[aide]=true
+        MOD_ENABLED[remove_packages]=true
+        MOD_ENABLED[session_timeout]=true
+        MOD_ENABLED[process_accounting]=true
+        ;;
   esac
 }
 
@@ -397,6 +478,28 @@ prompt_ssh_port() {
     warn "Invalid port '${input}'. Keeping current port ${current}."
     SSH_PORT=""
   fi
+}
+
+prompt_server_role() {
+  section "Server Type"
+  printf '  %b1%b  Frappe / ERPNext (80, 443)\n' "$C_GREEN" "$C_RESET"
+  printf '  %b2%b  Node.js (80, 443)\n' "$C_GREEN" "$C_RESET"
+  printf '  %b3%b  Docker (80, 443)\n' "$C_GREEN" "$C_RESET"
+  printf '  %b4%b  Database (3306)\n' "$C_GREEN" "$C_RESET"
+  printf '  %b5%b  Mail Server (25, 465, 587, 993, 995)\n' "$C_GREEN" "$C_RESET"
+  printf '  %b6%b  Web Server (80, 443)\n' "$C_GREEN" "$C_RESET"
+  printf '  %b7%b  Custom (Choose your own ports)\n\n' "$C_GREEN" "$C_RESET"
+
+  printf '%bChoose [7]:%b ' "$C_CYAN" "$C_RESET"
+  local input=""
+  read -r input
+  SKIP_PORTS_PROMPT=true
+  case "$input" in
+    1|2|3|6) ALLOWED_TCP_PORTS="80 443" ;;
+    4) ALLOWED_TCP_PORTS="3306" ;;
+    5) ALLOWED_TCP_PORTS="25 465 587 993 995" ;;
+    *) SKIP_PORTS_PROMPT=false ;;
+  esac
 }
 
 prompt_allowed_ports() {
@@ -422,25 +525,39 @@ summary_confirm() {
   cur="$(detect_ssh_port)"
   section "Summary"
   if [ "$DRY_RUN" = true ]; then
-    printf '  Mode:          %bPREVIEW (dry-run, no changes)%b\n' "$C_YELLOW" "$C_RESET"
+    printf '  Mode:          %bPreview (dry-run, no changes)%b\n' "$C_YELLOW" "$C_RESET"
   else
-    printf '  Mode:          %bAPPLY CHANGES%b\n' "$C_RED" "$C_RESET"
+    printf '  Mode:          %bApply%b\n' "$C_RED" "$C_RESET"
   fi
+  printf '  Profile:       %b%s%b\n\n' "$C_BOLD" "$SELECTED_PROFILE" "$C_RESET"
+
+  local enabled_cnt=0 disabled_cnt=0
+  for key in "${MOD_ORDER[@]}"; do
+    if [ "${MOD_ENABLED[$key]}" = true ]; then ((enabled_cnt++)); else ((disabled_cnt++)); fi
+  done
+  printf '  Modules Enabled : %d\n' "$enabled_cnt"
+  printf '  Modules Disabled: %d\n\n' "$disabled_cnt"
+
   if [ -n "$SSH_PORT" ] && [ "$SSH_PORT" != "$cur" ]; then
     printf '  SSH port:      %s to %s (safe migration)\n' "$cur" "$SSH_PORT"
   else
     printf '  SSH port:      %s (unchanged)\n' "${SSH_PORT:-$cur}"
   fi
-  printf '  Allowed ports: SSH + %s\n' "${ALLOWED_TCP_PORTS:-none}"
-  printf '  Modules:       '
-  first=1
+  printf '  Allowed ports: SSH + %s\n\n' "${ALLOWED_TCP_PORTS:-none}"
+
+  printf '  %bModules%b\n\n' "$C_BOLD" "$C_RESET"
   for key in "${MOD_ORDER[@]}"; do
     if [ "${MOD_ENABLED[$key]}" = true ]; then
-      if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
-      printf '%s' "$key"
+      printf '   ✓ %s\n' "${MOD_LABEL[$key]%% (*}"
     fi
   done
-  [ "$first" -eq 1 ] && printf '(none selected)'
+
+  printf '\n  %bDisabled%b\n\n' "$C_BOLD" "$C_RESET"
+  for key in "${MOD_ORDER[@]}"; do
+    if [ "${MOD_ENABLED[$key]}" = false ]; then
+      printf '   • %s\n' "${MOD_LABEL[$key]%% (*}"
+    fi
+  done
   printf '\n'
   warn_risky_ports
   printf '%bProceed? [y/N]:%b ' "$C_YELLOW" "$C_RESET"
@@ -526,6 +643,9 @@ Port ${SSH_PORT}"
   set_sshd IgnoreRhosts yes
   set_sshd HostbasedAuthentication no
   set_sshd AllowAgentForwarding no
+  set_sshd AllowTcpForwarding no
+  set_sshd PermitTunnel no
+  set_sshd GatewayPorts no
   set_sshd Banner /etc/issue.net
 
   # PermitRootLogin: only fully disable if a sudo user exists, else key-only root.
@@ -581,7 +701,7 @@ mod_firewall() {
   # so neither a port change nor module ordering can lock us out.
   local ssh_ports sp
   ssh_ports="$(printf '%s\n' "$(detect_ssh_port)" "$SSH_PORT" "${SSH_MIGRATE_OLD_PORT:-}" | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')"
-  info "Allowing SSH on port(s) ${ssh_ports}before enabling the firewall."
+  info "Allowing SSH on port(s) ${ssh_ports} before enabling the firewall."
 
   run ufw default deny incoming
   run ufw default allow outgoing
@@ -595,19 +715,40 @@ mod_firewall() {
   done
 
   run ufw logging on
-  run ufw --force enable
+  if [ "$DRY_RUN" = false ]; then
+    if ufw status | grep -q "Status: active"; then
+      info "UFW already enabled."
+    else
+      run ufw --force enable
+    fi
+  else
+    dry "ufw --force enable (or skipped if active)"
+  fi
   if [ "$DRY_RUN" = true ]; then
     dry "ufw status verbose"
   else
     ufw status verbose | tee -a "$LOGFILE"
   fi
-  ok "Firewall enabled. Allowed: SSH ${ssh_ports}plus: ${ALLOWED_TCP_PORTS:-none}."
+  ok "Firewall configured."
+  info "Allowed ports:"
+  printf "  SSH: %s\n" "$ssh_ports"
+  printf "  TCP: %s\n" "${ALLOWED_TCP_PORTS:-none}"
   mark applied firewall
 }
 
 mod_fail2ban() {
   head_ "4. Brute-force protection (fail2ban)"
-  apt_install fail2ban
+  if pkg_installed fail2ban; then
+    info "fail2ban already installed."
+    if systemctl is-enabled fail2ban >/dev/null 2>&1; then
+      info "fail2ban already enabled."
+    fi
+    if systemctl is-active fail2ban >/dev/null 2>&1; then
+      info "fail2ban already running."
+    fi
+  else
+    apt_install fail2ban
+  fi
   [ -z "$SSH_PORT" ] && SSH_PORT="$(detect_ssh_port)"
   write_file /etc/fail2ban/jail.local \
 "[DEFAULT]
@@ -873,6 +1014,25 @@ mod_clamav() {
 }
 
 
+print_security_status() {
+  local prof="${SELECTED_PROFILE:-Unknown}"
+  local check="✓" cross="✗"
+
+  printf '\n================================================\n\n'
+  printf 'Security Status\n\n'
+
+  printf '%s SSH Hardening\n' "$([ "${MOD_ENABLED[ssh]}" = true ] && echo "$check" || echo "$cross")"
+  printf '%s Firewall\n' "$([ "${MOD_ENABLED[firewall]}" = true ] && echo "$check" || echo "$cross")"
+  printf '%s Fail2Ban\n' "$([ "${MOD_ENABLED[fail2ban]}" = true ] && echo "$check" || echo "$cross")"
+  printf '%s Auditd\n' "$([ "${MOD_ENABLED[auditd]}" = true ] && echo "$check" || echo "$cross")"
+  printf '%s AIDE\n' "$([ "${MOD_ENABLED[aide]}" = true ] && echo "$check" || echo "$cross")"
+  printf '%s Chrony\n\n' "$([ "${MOD_ENABLED[timesync]}" = true ] && echo "$check" || echo "$cross")"
+
+  printf 'Profile\n'
+  printf '%s\n\n' "$prof"
+  printf '================================================\n\n'
+}
+
 # =====================================================================
 # Main
 # =====================================================================
@@ -895,7 +1055,10 @@ main() {
     [ "$MODE_SET" = false ] && prompt_mode
     prompt_scope
     prompt_ssh_port
-    prompt_allowed_ports
+    prompt_server_role
+    if [ "${SKIP_PORTS_PROMPT:-false}" = false ]; then
+      prompt_allowed_ports
+    fi
     summary_confirm
   else
     info "Non-interactive run. Using configuration defaults from the CONFIG block."
@@ -910,30 +1073,42 @@ main() {
   fi
   info "Log file: ${LOGFILE}"
 
-  if [ "${MOD_ENABLED[updates]}" = true ];             then mod_updates;             else skip "Patching (skipped)"; fi
-  if [ "${MOD_ENABLED[ssh]}" = true ];                 then mod_ssh;                 else skip "SSH hardening (skipped)"; fi
-  if [ "${MOD_ENABLED[firewall]}" = true ];            then mod_firewall;            else skip "Firewall (skipped)"; fi
-  if [ "${MOD_ENABLED[fail2ban]}" = true ];            then mod_fail2ban;            else skip "fail2ban (skipped)"; fi
-  if [ "${MOD_ENABLED[sysctl]}" = true ];              then mod_sysctl;              else skip "sysctl (skipped)"; fi
-  if [ "${MOD_ENABLED[auditd]}" = true ];              then mod_auditd;              else skip "auditd (skipped)"; fi
-  if [ "${MOD_ENABLED[timesync]}" = true ];            then mod_timesync;            else skip "Time sync (skipped)"; fi
-  if [ "${MOD_ENABLED[login_policy]}" = true ];        then mod_login_policy;        else skip "Login policy (skipped)"; fi
-  if [ "${MOD_ENABLED[disable_filesystems]}" = true ]; then mod_disable_filesystems; else skip "Disable filesystems (skipped)"; fi
-  if [ "${MOD_ENABLED[coredumps]}" = true ];           then mod_coredumps;           else skip "Core dumps (skipped)"; fi
-  if [ "${MOD_ENABLED[shared_memory]}" = true ];       then mod_shared_memory;       else skip "Shared memory (skipped)"; fi
-  if [ "${MOD_ENABLED[aide]}" = true ];                then mod_aide;                else skip "AIDE (skipped)"; fi
-  if [ "${MOD_ENABLED[remove_packages]}" = true ];     then mod_remove_packages;     else skip "Remove packages (skipped)"; fi
-  if [ "${MOD_ENABLED[session_timeout]}" = true ];     then mod_session_timeout;     else skip "Session timeout (skipped)"; fi
-  if [ "${MOD_ENABLED[process_accounting]}" = true ];  then mod_process_accounting;  else skip "Process accounting (skipped)"; fi
-  if [ "${MOD_ENABLED[clamav]}" = true ];              then mod_clamav;              else skip "clamav (skipped)"; fi
+  local mod
+  for mod in "${MOD_ORDER[@]}"; do
+    if [ "${MOD_ENABLED[$mod]}" = true ]; then
+      "mod_${mod}"
+    else
+      skip "${MOD_LABEL[$mod]%% (*} (skipped)"
+      mark skipped "$mod"
+    fi
+  done
 
   head_ "Summary"
-  info "Applied: ${APPLIED[*]:-none}"
-  info "Skipped: ${SKIPPED[*]:-none}"
-  if [ "${#FAILED[@]}" -gt 0 ]; then
-    err "Failed:  ${FAILED[*]}"
+
+  printf '  %bApplied Modules%b\n\n' "$C_BOLD" "$C_RESET"
+  if [ "${#APPLIED[@]}" -eq 0 ]; then
+    printf '   none\n'
   else
-    ok "Failed:  none"
+    for mod in "${APPLIED[@]}"; do
+      printf '   ✓ %s\n' "${MOD_LABEL[$mod]%% (*}"
+    done
+  fi
+  printf '\n'
+
+  printf '  %bSkipped Modules%b\n\n' "$C_BOLD" "$C_RESET"
+  if [ "${#SKIPPED[@]}" -eq 0 ]; then
+    printf '   none\n'
+  else
+    for mod in "${SKIPPED[@]}"; do
+      printf '   • %s\n' "${MOD_LABEL[$mod]%% (*}"
+    done
+  fi
+  printf '\n'
+
+  if [ "${#FAILED[@]}" -gt 0 ]; then
+    err "Failed: ${FAILED[*]}"
+  else
+    ok "Failed: none"
   fi
 
   _log ""
@@ -941,7 +1116,17 @@ main() {
     warn "This was a preview. Nothing changed. Run again and choose Apply when ready."
   else
     warn "Done. Before closing this session, open a NEW SSH session and confirm you can still log in."
-    warn "Some kernel and module changes take full effect only after a reboot."
+    print_security_status
+
+    printf 'A reboot is recommended.\n\n'
+    printf 'Reason:\n\n'
+    printf '✓ sysctl updated\n'
+    printf '✓ kernel parameters changed\n'
+    printf '✓ audit rules updated\n\n'
+    printf 'Run:\n\n'
+    printf 'sudo reboot\n\n'
+    printf 'when your maintenance window begins.\n'
+    printf '================================================\n'
   fi
 }
 
