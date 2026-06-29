@@ -161,7 +161,7 @@ Issues and pull requests are welcome. Keep changes idempotent, preserve the dry-
 
 ## License
 
-Not yet specified. Add a LICENSE file before publishing. MIT is a common choice for tooling like this.
+LICENCE
 
 ## Author
 
