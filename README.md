@@ -161,7 +161,7 @@ Issues and pull requests are welcome. Keep changes idempotent, preserve the dry-
 
 ## License
 
-LICENCE
+[LICENSE](https://github.com/Abhishek-Chougule/server-hardening/blob/main/LICENSE)
 
 ## Author
 
